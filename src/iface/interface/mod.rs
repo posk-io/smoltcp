@@ -155,6 +155,7 @@ pub struct InterfaceInner {
     routes: Routes,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
+    pub(crate) syncookie_secret: [u64; 2],
 }
 
 /// Configuration structure used for creating a network interface.
@@ -246,6 +247,9 @@ impl Interface {
             }
         }
 
+        let k0 = ((rand.rand_u32() as u64) << 32) | (rand.rand_u32() as u64);
+        let k1 = ((rand.rand_u32() as u64) << 32) | (rand.rand_u32() as u64);
+
         Interface {
             fragments: FragmentsBuffer {
                 #[cfg(feature = "proto-sixlowpan")]
@@ -284,6 +288,7 @@ impl Interface {
                 slaac: Slaac::new(),
                 #[cfg(feature = "proto-ipv6-slaac")]
                 slaac_updated: Instant::from_millis(0),
+                syncookie_secret: [k0, k1],
                 rand,
             },
         }

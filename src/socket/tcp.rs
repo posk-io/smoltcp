@@ -547,9 +547,68 @@ pub struct Socket<'a> {
     /// If this is set, we will not send a SYN|ACK until this is unset.
     #[cfg(feature = "socket-tcp-pause-synack")]
     synack_paused: bool,
+
+    /// Stored SYN|ACK reply for stateless SYN handling in LISTEN state.
+    synack_to_reply: Option<(IpRepr, TcpRepr<'static>)>,
+
+    /// Enable stateless SYN cookie behavior in LISTEN state.
+    use_syncookie: bool,
 }
 
 const DEFAULT_MSS: usize = 536;
+
+const SYNCOOKIE_SACK_BIT: u32 = 0x01;
+const SYNCOOKIE_WS_SHIFT: u32 = 1;
+const SYNCOOKIE_WS_MASK: u32 = 0x0F;
+const SYNCOOKIE_MSS_SHIFT: u32 = 5;
+const SYNCOOKIE_MSS_MASK: u32 = 0x07;
+
+const SYNCOOKIE_MSS_TABLE: [u16; 8] = [536, 1300, 1400, 1440, 1460, 1480, 1500, 9000];
+
+fn encode_syncookie_options(
+    max_seg_size: Option<u16>,
+    window_scale: Option<u8>,
+    sack_permitted: bool,
+) -> u8 {
+    let mut encoded = 0u8;
+    if sack_permitted {
+        encoded |= SYNCOOKIE_SACK_BIT as u8;
+    }
+
+    let ws_encoded = match window_scale {
+        Some(ws) => ws.min(14),
+        None => 15,
+    };
+    encoded |= (ws_encoded & SYNCOOKIE_WS_MASK as u8) << SYNCOOKIE_WS_SHIFT;
+
+    let mss_val = max_seg_size.unwrap_or(536);
+    // Find closest MSS in table
+    let mss_idx = SYNCOOKIE_MSS_TABLE
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &val)| (val as i32 - mss_val as i32).abs())
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    encoded |= (mss_idx as u8 & SYNCOOKIE_MSS_MASK as u8) << SYNCOOKIE_MSS_SHIFT;
+
+    encoded
+}
+
+fn decode_syncookie_options(encoded: u8) -> (u16, Option<u8>, bool) {
+    let sack_permitted = (encoded & SYNCOOKIE_SACK_BIT as u8) != 0;
+
+    let ws_encoded = (encoded >> SYNCOOKIE_WS_SHIFT) & SYNCOOKIE_WS_MASK as u8;
+    let window_scale = if ws_encoded == 15 {
+        None
+    } else {
+        Some(ws_encoded)
+    };
+
+    let mss_idx = (encoded >> SYNCOOKIE_MSS_SHIFT) & SYNCOOKIE_MSS_MASK as u8;
+    let max_seg_size = SYNCOOKIE_MSS_TABLE[mss_idx as usize];
+
+    (max_seg_size, window_scale, sack_permitted)
+}
 
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
@@ -613,6 +672,9 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-pause-synack")]
             synack_paused: false,
+
+            synack_to_reply: None,
+            use_syncookie: false,
         }
     }
 
@@ -739,6 +801,16 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "socket-tcp-pause-synack")]
     pub fn pause_synack(&mut self, pause: bool) {
         self.synack_paused = pause;
+    }
+
+    /// Set whether stateless SYN cookies are enabled.
+    pub fn set_use_syncookie(&mut self, value: bool) {
+        self.use_syncookie = value;
+    }
+
+    /// Return whether stateless SYN cookies are enabled.
+    pub fn use_syncookie(&self) -> bool {
+        self.use_syncookie
     }
 
     /// Return the current window field value, including scaling according to RFC 1323.
@@ -1533,7 +1605,8 @@ impl<'a> Socket<'a> {
         // it cannot be destined to this socket, but another one may well listen
         // on the same local endpoint.
         if self.state == State::Listen
-            && (repr.ack_number.is_some() || repr.control == TcpControl::Rst)
+            && ((repr.ack_number.is_some() && !self.use_syncookie)
+                || repr.control == TcpControl::Rst)
         {
             return false;
         }
@@ -1592,8 +1665,61 @@ impl<'a> Socket<'a> {
             (_, TcpControl::Rst, _) => (),
             // The initial SYN cannot contain an acknowledgement.
             (State::Listen, _, None) => (),
-            // This case is handled in `accepts()`.
-            (State::Listen, _, Some(_)) => unreachable!(),
+            (State::Listen, TcpControl::None, Some(ack_number)) => {
+                if is_valid_syncookie(
+                    cx.syncookie_secret,
+                    ip_repr,
+                    repr,
+                    ack_number.0 as u32,
+                    cx.now().secs() as u64,
+                ) {
+                    tcp_trace!("valid SYN cookie ACK received");
+
+                    self.tuple = Some(Tuple {
+                        local: IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
+                        remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
+                    });
+
+                    // Restore sequence numbers
+                    self.local_seq_no = ack_number;
+                    self.remote_seq_no = repr.seq_number;
+                    self.remote_last_seq = self.local_seq_no;
+                    self.remote_last_ack = None; // Reset
+                    self.remote_win_len = repr.window_len as usize;
+
+                    let mut max_seg_size = DEFAULT_MSS as u16;
+                    let mut window_scale = None;
+                    let mut sack_permitted = false;
+
+                    if let Some(ack_ts) = repr.timestamp {
+                        if ack_ts.tsecr != 0 {
+                            let encoded = (ack_ts.tsecr & 0xFF) as u8;
+                            let decoded = decode_syncookie_options(encoded);
+                            max_seg_size = decoded.0;
+                            window_scale = decoded.1;
+                            sack_permitted = decoded.2;
+                            tcp_trace!(
+                                "decoded syncookie options: MSS={}, WS={:?}, SACK={}",
+                                max_seg_size,
+                                window_scale,
+                                sack_permitted
+                            );
+                        }
+                    }
+
+                    self.remote_mss = max_seg_size as usize;
+                    self.remote_has_sack = sack_permitted;
+                    self.remote_win_scale = window_scale;
+                    self.remote_win_shift = window_scale.unwrap_or(0);
+
+                    self.set_state(State::Established);
+                    self.synack_to_reply = None; // Consume
+                    self.timer.set_for_idle(cx.now(), self.keep_alive);
+                } else {
+                    net_debug!("unacceptable ACK in LISTEN state (invalid SYN cookie)");
+                    return Some(Self::rst_reply(ip_repr, repr));
+                }
+            }
             // SYN|ACK in the SYN-SENT state must have the exact ACK number.
             (State::SynSent, TcpControl::Syn, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
@@ -1838,39 +1964,93 @@ impl<'a> Socket<'a> {
                 return None;
             }
 
-            // SYN packets in the LISTEN state change it to SYN-RECEIVED.
+            // SYN packets in the LISTEN state trigger a stateless SYN|ACK reply.
             (State::Listen, TcpControl::Syn) => {
                 tcp_trace!("received SYN");
                 if let Some(max_seg_size) = repr.max_seg_size {
                     if max_seg_size == 0 {
-                        tcp_trace!("received SYNACK with zero MSS, ignoring");
+                        tcp_trace!("received SYN with zero MSS, ignoring");
                         return None;
                     }
-                    self.congestion_controller
-                        .inner_mut()
-                        .set_mss(max_seg_size as usize);
-                    self.remote_mss = max_seg_size as usize
+                    if !self.use_syncookie {
+                        self.congestion_controller
+                            .inner_mut()
+                            .set_mss(max_seg_size as usize);
+                        self.remote_mss = max_seg_size as usize
+                    }
                 }
 
-                self.tuple = Some(Tuple {
-                    local: IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
-                    remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
-                });
-                self.local_seq_no = Self::random_seq_no(cx);
-                self.remote_seq_no = repr.seq_number + 1;
-                self.remote_last_seq = self.local_seq_no;
-                self.remote_has_sack = repr.sack_permitted;
-                self.remote_win_scale = repr.window_scale;
-                // Remote doesn't support window scaling, don't do it.
-                if self.remote_win_scale.is_none() {
-                    self.remote_win_shift = 0;
+                if self.use_syncookie {
+                    let (_ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
+                    reply_repr.control = TcpControl::Syn;
+                    let isn = generate_syncookie_isn(
+                        cx.syncookie_secret,
+                        ip_repr,
+                        repr,
+                        cx.now().secs() as u64,
+                    );
+                    reply_repr.seq_number = TcpSeqNumber(isn as i32);
+                    reply_repr.ack_number = Some(repr.seq_number + 1);
+                    reply_repr.window_len =
+                        u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+
+                    let encoded_options = encode_syncookie_options(
+                        repr.max_seg_size,
+                        repr.window_scale,
+                        repr.sack_permitted,
+                    );
+
+                    reply_repr.sack_permitted = repr.sack_permitted;
+                    reply_repr.window_scale = repr.window_scale;
+
+                    reply_repr.timestamp = repr.timestamp.map(|syn_ts| {
+                        let base_tsval = self
+                            .tsval_generator
+                            .map(|generator_fn| generator_fn())
+                            .unwrap_or(0);
+                        // Encode in lowest 8 bits
+                        let tsval = (base_tsval & !0xFF) | (encoded_options as u32);
+                        TcpTimestampRepr::new(tsval, syn_ts.tsval)
+                    });
+
+                    // Fill the MSS option as dispatch would
+                    let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
+                    reply_repr.max_seg_size = Some(max_segment_size as u16);
+
+                    let ip_reply_repr = IpRepr::new(
+                        ip_repr.dst_addr(),
+                        ip_repr.src_addr(),
+                        IpProtocol::Tcp,
+                        reply_repr.buffer_len(),
+                        64,
+                    );
+
+                    self.synack_to_reply = Some((ip_reply_repr, reply_repr));
+
+                    // Do NOT change state, do NOT update tuple.
+                    return None;
+                } else {
+                    // Original state-consuming flow
+                    self.tuple = Some(Tuple {
+                        local: IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
+                        remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
+                    });
+                    self.local_seq_no = Self::random_seq_no(cx);
+                    self.remote_seq_no = repr.seq_number + 1;
+                    self.remote_last_seq = self.local_seq_no;
+                    self.remote_has_sack = repr.sack_permitted;
+                    self.remote_win_scale = repr.window_scale;
+                    // Remote doesn't support window scaling, don't do it.
+                    if self.remote_win_scale.is_none() {
+                        self.remote_win_shift = 0;
+                    }
+                    // Remote doesn't support timestamping, don't do it.
+                    if repr.timestamp.is_none() {
+                        self.tsval_generator = None;
+                    }
+                    self.set_state(State::SynReceived);
+                    self.timer.set_for_idle(cx.now(), self.keep_alive);
                 }
-                // Remote doesn't support timestamping, don't do it.
-                if repr.timestamp.is_none() {
-                    self.tsval_generator = None;
-                }
-                self.set_state(State::SynReceived);
-                self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
 
             // ACK packets in the SYN-RECEIVED state change it to ESTABLISHED.
@@ -2353,6 +2533,10 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
+        if let Some((ip_repr, tcp_repr)) = self.synack_to_reply.take() {
+            return emit(cx, (ip_repr, tcp_repr));
+        }
+
         if self.tuple.is_none() {
             return Ok(());
         }
@@ -3296,6 +3480,126 @@ mod test {
         assert_eq!(s.listen(80), Ok(()));
         s.set_state(State::SynReceived); // state change, simulate incoming connection
         assert_eq!(s.listen(80), Err(ListenError::InvalidState));
+    }
+
+    #[test]
+    fn test_listening_socket_consumed_by_syn() {
+        let mut s = socket_listen();
+
+        // Client A sends SYN
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+
+        // Client A receives SYN|ACK
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+
+        assert_eq!(s.state, State::SynReceived);
+
+        // Client B sends SYN
+        let ip_repr_b = IpReprIpvX(IpvXRepr {
+            src_addr: OTHER_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: 20,
+            hop_limit: 64,
+        });
+        let tcp_repr_b = TcpRepr {
+            src_port: REMOTE_PORT + 1,
+            dst_port: LOCAL_PORT,
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            ..SEND_TEMPL
+        };
+
+        assert!(!s.socket.accepts(&mut s.cx, &ip_repr_b, &tcp_repr_b));
+    }
+
+    #[test]
+    fn test_syncookie() {
+        let mut s = socket_listen();
+        s.set_use_syncookie(true);
+
+        // Client A sends SYN
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+
+        // Client A receives SYN|ACK
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: TcpSeqNumber(50515666),
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+
+        assert_eq!(s.state, State::Listen);
+    }
+
+    #[test]
+    fn test_syncookie_options_encoding() {
+        let test_cases = &[
+            // (mss_in, ws_in, sack_in, mss_out, ws_out, sack_out)
+            (Some(1460), Some(7), true, 1460, Some(7), true),
+            (Some(1440), Some(14), false, 1440, Some(14), false),
+            (None, None, false, 536, None, false),
+            (Some(1500), Some(0), true, 1500, Some(0), true),
+            // MSS rounding/clamping to closest
+            (Some(1455), Some(8), true, 1460, Some(8), true),
+            (Some(1340), Some(2), false, 1300, Some(2), false),
+            (Some(9000), Some(5), true, 9000, Some(5), true),
+        ];
+
+        for &(mss_in, ws_in, sack_in, mss_out, ws_out, sack_out) in test_cases {
+            let encoded = encode_syncookie_options(mss_in, ws_in, sack_in);
+            let decoded = decode_syncookie_options(encoded);
+            assert_eq!(
+                decoded,
+                (mss_out, ws_out, sack_out),
+                "Failed for MSS={:?}, WS={:?}, SACK={}",
+                mss_in,
+                ws_in,
+                sack_in
+            );
+        }
+    }
+
+    #[test]
+    fn test_syncookie_options_clamping() {
+        // WS clamped to 14
+        let encoded = encode_syncookie_options(Some(1460), Some(15), true);
+        let decoded = decode_syncookie_options(encoded);
+        assert_eq!(decoded, (1460, Some(14), true));
+
+        let encoded = encode_syncookie_options(Some(1460), Some(255), false);
+        let decoded = decode_syncookie_options(encoded);
+        assert_eq!(decoded, (1460, Some(14), false));
     }
 
     #[test]
@@ -5509,6 +5813,44 @@ mod test {
         );
         assert_eq!(s.state(), State::Established);
         assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
+        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1);
+    }
+
+    #[test]
+    fn test_three_way_cookie() {
+        let mut s = socket_listen();
+        s.set_use_syncookie(true);
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::Listen);
+        assert!(s.tuple.is_none());
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: TcpSeqNumber(50515666),
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(TcpSeqNumber(50515666 + 1)),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::Established);
+        assert_eq!(s.local_seq_no, TcpSeqNumber(50515666 + 1));
         assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1);
     }
 
@@ -8999,4 +9341,201 @@ mod test {
         recv_nothing!(s);
         assert_eq!(s.state, State::Closed);
     }
+}
+
+// =========================================================================================//
+// SYN Cookie SipHash-1-3 implementation and helper functions
+// =========================================================================================//
+
+fn sipround(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+    *v0 = v0.wrapping_add(*v1);
+    *v2 = v2.wrapping_add(*v3);
+    *v1 = v1.rotate_left(13) ^ *v0;
+    *v3 = v3.rotate_left(16) ^ *v2;
+    *v0 = v0.rotate_left(32);
+    *v2 = v2.wrapping_add(*v1);
+    *v0 = v0.wrapping_add(*v3);
+    *v1 = v1.rotate_left(17) ^ *v2;
+    *v3 = v3.rotate_left(21) ^ *v0;
+    *v2 = v2.rotate_left(32);
+}
+
+fn siphash_1_3(key: [u64; 2], m: &[u64], _len_bytes: u8) -> u64 {
+    let mut v0 = key[0] ^ 0x736f6d6570736575;
+    let mut v1 = key[1] ^ 0x646f72616e646f6d;
+    let mut v2 = key[0] ^ 0x6c7967656e657261;
+    let mut v3 = key[1] ^ 0x7465646279746573;
+
+    for &block in m {
+        v3 ^= block;
+        sipround(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^= block;
+    }
+
+    v2 ^= 0xff;
+    sipround(&mut v0, &mut v1, &mut v2, &mut v3);
+    sipround(&mut v0, &mut v1, &mut v2, &mut v3);
+    sipround(&mut v0, &mut v1, &mut v2, &mut v3);
+
+    v0 ^ v1 ^ v2 ^ v3
+}
+
+fn compute_syncookie_hash(
+    secret: [u64; 2],
+    ip_repr: &IpRepr,
+    repr: &TcpRepr,
+    timestamp_counter: u32,
+) -> u64 {
+    match ip_repr.src_addr() {
+        #[cfg(feature = "proto-ipv4")]
+        IpAddress::Ipv4(_) => {
+            let mut m = [0u64; 2];
+            let src_ip_bytes = match ip_repr.src_addr() {
+                IpAddress::Ipv4(a) => a.octets(),
+                _ => unreachable!(),
+            };
+            let dst_ip_bytes = match ip_repr.dst_addr() {
+                IpAddress::Ipv4(a) => a.octets(),
+                _ => unreachable!(),
+            };
+            let mut w1 = 0u64;
+            w1 |= u64::from_le_bytes([
+                src_ip_bytes[0],
+                src_ip_bytes[1],
+                src_ip_bytes[2],
+                src_ip_bytes[3],
+                dst_ip_bytes[0],
+                dst_ip_bytes[1],
+                dst_ip_bytes[2],
+                dst_ip_bytes[3],
+            ]);
+            m[0] = w1;
+
+            let mut w2 = 0u64;
+            let src_port_bytes = repr.src_port.to_le_bytes();
+            let dst_port_bytes = repr.dst_port.to_le_bytes();
+            let ts_bytes = (timestamp_counter as u32).to_le_bytes();
+            w2 |= u64::from_le_bytes([
+                src_port_bytes[0],
+                src_port_bytes[1],
+                dst_port_bytes[0],
+                dst_port_bytes[1],
+                ts_bytes[0],
+                0,
+                0,
+                16,
+            ]);
+            m[1] = w2;
+            siphash_1_3(secret, &m, 16)
+        }
+        #[cfg(feature = "proto-ipv6")]
+        IpAddress::Ipv6(_) => {
+            let mut m = [0u64; 5];
+            let src_ip_bytes = match ip_repr.src_addr() {
+                IpAddress::Ipv6(a) => a.octets(),
+                _ => unreachable!(),
+            };
+            let dst_ip_bytes = match ip_repr.dst_addr() {
+                IpAddress::Ipv6(a) => a.octets(),
+                _ => unreachable!(),
+            };
+            m[0] = u64::from_le_bytes([
+                src_ip_bytes[0],
+                src_ip_bytes[1],
+                src_ip_bytes[2],
+                src_ip_bytes[3],
+                src_ip_bytes[4],
+                src_ip_bytes[5],
+                src_ip_bytes[6],
+                src_ip_bytes[7],
+            ]);
+            m[1] = u64::from_le_bytes([
+                src_ip_bytes[8],
+                src_ip_bytes[9],
+                src_ip_bytes[10],
+                src_ip_bytes[11],
+                src_ip_bytes[12],
+                src_ip_bytes[13],
+                src_ip_bytes[14],
+                src_ip_bytes[15],
+            ]);
+            m[2] = u64::from_le_bytes([
+                dst_ip_bytes[0],
+                dst_ip_bytes[1],
+                dst_ip_bytes[2],
+                dst_ip_bytes[3],
+                dst_ip_bytes[4],
+                dst_ip_bytes[5],
+                dst_ip_bytes[6],
+                dst_ip_bytes[7],
+            ]);
+            m[3] = u64::from_le_bytes([
+                dst_ip_bytes[8],
+                dst_ip_bytes[9],
+                dst_ip_bytes[10],
+                dst_ip_bytes[11],
+                dst_ip_bytes[12],
+                dst_ip_bytes[13],
+                dst_ip_bytes[14],
+                dst_ip_bytes[15],
+            ]);
+            let src_port_bytes = repr.src_port.to_le_bytes();
+            let dst_port_bytes = repr.dst_port.to_le_bytes();
+            let ts_bytes = (timestamp_counter as u32).to_le_bytes();
+            m[4] = u64::from_le_bytes([
+                src_port_bytes[0],
+                src_port_bytes[1],
+                dst_port_bytes[0],
+                dst_port_bytes[1],
+                ts_bytes[0],
+                0,
+                0,
+                40,
+            ]);
+            siphash_1_3(secret, &m, 40)
+        }
+    }
+}
+
+fn generate_syncookie_isn(
+    secret: [u64; 2],
+    ip_repr: &IpRepr,
+    repr: &TcpRepr,
+    now_secs: u64,
+) -> u32 {
+    let timestamp_counter = ((now_secs / 64) & 0x1F) as u32;
+    let computed_hash = compute_syncookie_hash(secret, ip_repr, repr, timestamp_counter);
+    let hash_mask = 0x07FFFFFF;
+    (timestamp_counter << 27) | (computed_hash as u32 & hash_mask)
+}
+
+fn is_valid_syncookie(
+    secret: [u64; 2],
+    ip_repr: &IpRepr,
+    repr: &TcpRepr,
+    ack_number: u32,
+    now_secs: u64,
+) -> bool {
+    let sent_isn = ack_number.wrapping_sub(1);
+    let extracted_counter = (sent_isn >> 27) & 0x1F;
+    let hash_mask = 0x07FFFFFF;
+    let sent_hash = sent_isn & hash_mask;
+
+    let current_counter = ((now_secs / 64) & 0x1F) as u32;
+
+    let mut valid_counter = false;
+    for i in 0..3 {
+        let expected = (current_counter.wrapping_sub(i)) & 0x1F;
+        if extracted_counter == expected {
+            valid_counter = true;
+            break;
+        }
+    }
+
+    if !valid_counter {
+        return false;
+    }
+
+    let computed_hash = compute_syncookie_hash(secret, ip_repr, repr, extracted_counter);
+    sent_hash == (computed_hash as u32 & hash_mask)
 }
